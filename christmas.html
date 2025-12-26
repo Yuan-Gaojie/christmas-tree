@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Christmas Tree Spin (Web)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; }
+
+    /* overlay UI (because browsers block autoplay audio without a user gesture) */
+    .overlay {
+      position:fixed; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      background: radial-gradient(ellipse at center, rgba(0,0,0,.35), rgba(0,0,0,.85));
+      color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans", Arial, sans-serif;
+      z-index:10;
+    }
+    .card {
+      width:min(520px, 92vw);
+      background: rgba(18,18,18,.85);
+      border:1px solid rgba(255,255,255,.12);
+      border-radius:16px;
+      padding:20px 18px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.55);
+      text-align:center;
+      backdrop-filter: blur(6px);
+    }
+    .title { font-size:18px; font-weight:700; margin:0 0 8px; }
+    .desc { opacity:.85; font-size:13px; margin:0 0 14px; line-height:1.5; }
+    .row { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+    button {
+      cursor:pointer;
+      border:0; border-radius:12px;
+      padding:10px 14px;
+      font-weight:700;
+      background:#e53935; color:#fff;
+    }
+    button.secondary { background: rgba(255,255,255,.14); }
+    .hint { margin-top:10px; font-size:12px; opacity:.75; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <!-- Put your .ogg next to this HTML: 圣诞节氛围小曲.ogg -->
+  <audio id="bgm" loop preload="auto">
+    <source src="圣诞节氛围小曲.ogg" type="audio/ogg" />
+  </audio>
+
+  <div class="overlay" id="overlay">
+    <div class="card">
+      <p class="title">🎄 圣诞树旋转效果（网页版）</p>
+      <p class="desc">
+        由于浏览器限制，背景音乐需要你点一次“开始”才能播放。<br/>
+        把本 HTML 和 <b>圣诞节氛围小曲.ogg</b> 放在同一目录即可。
+      </p>
+      <div class="row">
+        <button id="start">开始（播放音乐）</button>
+        <button class="secondary" id="startNoAudio">仅开始（静音）</button>
+      </div>
+      <div class="hint">按键：M 静音 / 恢复 ｜ ↑↓ 调音量</div>
+    </div>
+  </div>
+
+  <script>
+    // =========================
+    // Utilities
+    // =========================
+    const TAU = Math.PI * 2;
+    const clamp = (x, a, b) => x < a ? a : (x > b ? b : x);
+
+    function mulberry32(seed) {
+      let t = seed >>> 0;
+      return function() {
+        t += 0x6D2B79F5;
+        let r = Math.imul(t ^ (t >>> 15), 1 | t);
+        r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+        return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function project3D(x, y, z, fov, cx, cy) {
+      let zz = z + fov;
+      if (zz < 1) zz = 1;
+      const s = fov / zz;
+      return { x: cx + x * s, y: cy + y * s, s };
+    }
+
+    function rotateY(x, z, ca, sa) {
+      return { x: x * ca + z * sa, z: -x * sa + z * ca };
+    }
+
+    // Simple glow dot
+    function drawGlowDot(ctx, x, y, coreR, glowR, rgb, alphaCore=0.95, alphaGlow=0.28) {
+      // glow
+      const g = ctx.createRadialGradient(x, y, 0, x, y, glowR);
+      g.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alphaGlow})`);
+      g.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, glowR, 0, TAU);
+      ctx.fill();
+
+      // core
+      ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alphaCore})`;
+      ctx.beginPath();
+      ctx.arc(x, y, coreR, 0, TAU);
+      ctx.fill();
+    }
+
+    // Glowy line segment (for ribbon)
+    function drawGlowLine(ctx, x1, y1, x2, y2, w, gw, coreA=0.95, glowA=0.22) {
+      // glow
+      ctx.strokeStyle = `rgba(255,255,255,${glowA})`;
+      ctx.lineWidth = gw;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      // core
+      ctx.strokeStyle = `rgba(255,255,255,${coreA})`;
+      ctx.lineWidth = w;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    // Star
+    function drawStar(ctx, cx, cy, rOuter, rInner, rot, color="rgba(255,220,70,1)") {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (let i = 0; i < 10; i++) {
+        const a = rot + i * Math.PI / 5;
+        const r = (i % 2 === 0) ? rOuter : rInner;
+        const x = cx + Math.cos(a) * r;
+        const y = cy + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // =========================
+    // Scene setup
+    // =========================
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+
+    const overlay = document.getElementById("overlay");
+    const btnStart = document.getElementById("start");
+    const btnStartNoAudio = document.getElementById("startNoAudio");
+    const bgm = document.getElementById("bgm");
+
+    let DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    let W = 0, H = 0;
+
+    function resize() {
+      DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      W = Math.floor(window.innerWidth);
+      H = Math.floor(window.innerHeight);
+      canvas.width = Math.floor(W * DPR);
+      canvas.height = Math.floor(H * DPR);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    // Deterministic-ish random
+    const rand = mulberry32(Date.now() & 0xffffffff);
+
+    // Colors
+    const TREE_GREEN = [30, 180, 70];
+    const TRUNK = [110, 70, 35];
+    const STAR = [255, 220, 70];
+    const SNOW = [235, 245, 255];
+    const LIGHT_COLORS = [
+      [255, 80, 80],
+      [80, 255, 120],
+      [80, 160, 255],
+      [255, 220, 80],
+      [255, 120, 220],
+      [200, 255, 255],
+    ];
+
+    // Tree parameters (feel free to tweak)
+    const treeHeight = 460;
+    const treeRadius = 240;
+    const fov = 520;
+
+    // Build point-cloud tree inside a cone
+    const treePoints = [];
+    const nPoints = 2600;
+    for (let i = 0; i < nPoints; i++) {
+      const y = Math.pow(rand(), 0.6) * treeHeight;
+      const rMax = (y / treeHeight) * treeRadius;
+      const r = rMax * (0.35 + 0.65 * Math.pow(rand(), 0.35));
+      const a = rand() * TAU;
+      treePoints.push({ x: Math.cos(a) * r, y, z: Math.sin(a) * r });
+    }
+
+    // Lights near the surface
+    const lights = [];
+    const nLights = 140;
+    for (let i = 0; i < nLights; i++) {
+      const y = Math.pow(rand(), 0.75) * treeHeight;
+      const rMax = (y / treeHeight) * treeRadius;
+      const r = rMax * (0.85 + 0.15 * rand());
+      const a = rand() * TAU;
+      const col = LIGHT_COLORS[(rand() * LIGHT_COLORS.length) | 0];
+      lights.push({
+        x: Math.cos(a) * r, y, z: Math.sin(a) * r,
+        col, phase: rand() * TAU, size: 2 + ((rand() * 3) | 0)
+      });
+    }
+
+    // Snowflakes
+    const snow = [];
+    const nSnow = 260;
+    for (let i = 0; i < nSnow; i++) {
+      snow.push({
+        x: rand() * W,
+        y: rand() * H,
+        vx: (rand() * 40 - 20),
+        vy: 40 + rand() * 120,
+        r: 1.2 + rand() * 2.0,
+        wob: 0.8 + rand() * 1.4,
+        ph: rand() * TAU
+      });
+    }
+
+    // Spiral ribbon path (3D) bottom -> top
+    const spiral = [];
+    const turns = 7.0;
+    const samples = 1050;
+    for (let i = 0; i < samples; i++) {
+      const t = i / (samples - 1);
+      const y = (1.0 - t) * treeHeight;
+      const r = (y / treeHeight) * treeRadius;
+      const ang = (t * turns) * TAU;
+      const wob = Math.sin(ang * 2.0) * 2.0 + Math.sin(ang * 7.0) * 0.9;
+      const rr = r * 0.98 + wob;
+      spiral.push({ x: Math.cos(ang) * rr, y, z: Math.sin(ang) * rr, ht: y / treeHeight });
+    }
+
+    // Time / animation
+    let started = false;
+    let last = performance.now();
+    let t0 = performance.now();
+    let angle = 0;
+
+    // Audio control
+    let muted = false;
+    let volume = 0.5;
+
+    function setVolume(v) {
+      volume = clamp(v, 0, 1);
+      bgm.volume = muted ? 0 : volume;
+    }
+    setVolume(volume);
+
+    window.addEventListener("keydown", (e) => {
+      if (!started) return;
+      if (e.key.toLowerCase() === "m") {
+        muted = !muted;
+        setVolume(volume);
+      }
+      if (e.key === "ArrowUp") setVolume(volume + 0.05);
+      if (e.key === "ArrowDown") setVolume(volume - 0.05);
+    });
+
+    async function start(playAudio) {
+      overlay.style.display = "none";
+      started = true;
+
+      if (playAudio) {
+        try {
+          bgm.currentTime = 0;
+          setVolume(volume);
+          await bgm.play();
+        } catch (err) {
+          // If play fails (rare), just continue without audio
+          console.warn("Audio play blocked/failed:", err);
+        }
+      } else {
+        muted = true;
+        setVolume(volume);
+      }
+
+      last = performance.now();
+      t0 = performance.now();
+      requestAnimationFrame(frame);
+    }
+
+    btnStart.addEventListener("click", () => start(true));
+    btnStartNoAudio.addEventListener("click", () => start(false));
+
+    // =========================
+    // Render
+    // =========================
+    function frame(now) {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+      const t = (now - t0) / 1000;
+
+      // Motion
+      angle += dt * 0.9;
+      const ca = Math.cos(angle);
+      const sa = Math.sin(angle);
+
+      // Clear
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, W, H);
+
+      const cx = W * 0.5;
+      const cy = H * 0.60;
+
+      // Snow update + draw (behind)
+      for (const f of snow) {
+        f.ph += dt * f.wob;
+        f.x += f.vx * dt + Math.sin(f.ph) * 12 * dt;
+        f.y += f.vy * dt;
+        if (f.y > H + 10) { f.y = -10; f.x = rand() * W; }
+        if (f.x < -20) f.x = W + 20;
+        if (f.x > W + 20) f.x = -20;
+
+        ctx.fillStyle = `rgba(${SNOW[0]},${SNOW[1]},${SNOW[2]},1)`;
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, f.r, 0, TAU);
+        ctx.fill();
+      }
+
+      // =========================
+      // Draw tree point cloud (depth sorted)
+      // =========================
+      const pts2d = [];
+      for (const p of treePoints) {
+        let { x: xr, z: zr } = rotateY(p.x, p.z, ca, sa);
+        xr += Math.sin(t * 0.7 + p.y * 0.02) * 2.0;
+
+        const P = project3D(xr, p.y - treeHeight * 0.6, zr, fov, cx, cy);
+
+        const depth = clamp((zr + treeRadius) / (2 * treeRadius), 0, 1);
+        const ht = clamp(p.y / treeHeight, 0, 1);
+        let shade = (0.65 + 0.35 * (1 - depth)) * (0.85 + 0.15 * (1 - ht));
+
+        const col = [
+          Math.floor(TREE_GREEN[0] * shade),
+          Math.floor(TREE_GREEN[1] * shade),
+          Math.floor(TREE_GREEN[2] * shade)
+        ];
+
+        const rad = Math.max(1, Math.floor(2.0 * P.s));
+        pts2d.push({ z: zr, x: P.x, y: P.y, r: rad, col });
+      }
+      pts2d.sort((a, b) => a.z - b.z);
+      for (const d of pts2d) {
+        ctx.fillStyle = `rgba(${d.col[0]},${d.col[1]},${d.col[2]},1)`;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, TAU);
+        ctx.fill();
+      }
+
+      // =========================
+      // Trunk (simple particle cylinder)
+      // =========================
+      const trunkPts = [];
+      const trunkH = 90;
+      const trunkR = 30;
+      for (let i = 0; i < 380; i++) {
+        const yy = (treeHeight * 0.35) + rand() * trunkH;
+        const rr = trunkR * (0.65 + 0.35 * rand());
+        const a = rand() * TAU;
+        const x = Math.cos(a) * rr;
+        const z = Math.sin(a) * rr;
+        const R = rotateY(x, z, ca, sa);
+        const P = project3D(R.x, yy - treeHeight * 0.6, R.z, fov, cx, cy);
+        const depth = clamp((R.z + trunkR) / (2 * trunkR), 0, 1);
+        const shade = 0.7 + 0.3 * (1 - depth);
+        const col = [
+          Math.floor(TRUNK[0] * shade),
+          Math.floor(TRUNK[1] * shade),
+          Math.floor(TRUNK[2] * shade)
+        ];
+        trunkPts.push({ z: R.z, x: P.x, y: P.y, r: Math.max(1, Math.floor(2.2 * P.s)), col });
+      }
+      trunkPts.sort((a, b) => a.z - b.z);
+      for (const d of trunkPts) {
+        ctx.fillStyle = `rgba(${d.col[0]},${d.col[1]},${d.col[2]},1)`;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, TAU);
+        ctx.fill();
+      }
+
+      // =========================
+      // Lights (glow), depth sorted
+      // =========================
+      const light2d = [];
+      for (const L of lights) {
+        const R = rotateY(L.x, L.z, ca, sa);
+        const P = project3D(R.x, L.y - treeHeight * 0.6, R.z, fov, cx, cy);
+
+        let pulse = 0.55 + 0.45 * Math.sin(t * 3.2 + L.phase);
+        pulse = clamp(pulse, 0.15, 1.0);
+
+        const coreR = (L.size + 1) * P.s * (0.9 + 0.6 * pulse);
+        const glowR = coreR * 3.2;
+
+        const col = [
+          Math.floor(L.col[0] * (0.6 + 0.55 * pulse)),
+          Math.floor(L.col[1] * (0.6 + 0.55 * pulse)),
+          Math.floor(L.col[2] * (0.6 + 0.55 * pulse)),
+        ];
+
+        light2d.push({ z: R.z, x: P.x, y: P.y, coreR, glowR, col, pulse });
+      }
+      light2d.sort((a, b) => a.z - b.z);
+      for (const d of light2d) {
+        drawGlowDot(ctx, d.x, d.y, Math.max(1, d.coreR), Math.max(2, d.glowR), d.col,
+          0.65 + 0.3 * d.pulse, 0.16 + 0.18 * d.pulse);
+      }
+
+      // =========================
+      // Spiral ribbon (continuous, depth-sorted segments)
+      // =========================
+      const segs = [];
+      for (let i = 0; i < spiral.length - 1; i++) {
+        const a = spiral[i];
+        const b = spiral[i + 1];
+
+        const Ra = rotateY(a.x, a.z, ca, sa);
+        const Rb = rotateY(b.x, b.z, ca, sa);
+
+        const Pa = project3D(Ra.x, a.y - treeHeight * 0.6, Ra.z, fov, cx, cy);
+        const Pb = project3D(Rb.x, b.y - treeHeight * 0.6, Rb.z, fov, cx, cy);
+
+        const zavg = (Ra.z + Rb.z) * 0.5;
+        const savg = (Pa.s + Pb.s) * 0.5;
+
+        // thicker near bottom + perspective
+        const ht = (a.ht + b.ht) * 0.5;
+        // 细很多的白色螺旋线（不挡树）
+        const baseW = 1.5 + 2.0 * (1.0 - ht);      // 原来 3~7 → 现在 1.5~3.5
+        const w = Math.max(1, baseW * (0.8 + 0.5 * savg));
+        const gw = w + 4 + 4 * savg;               // 原来 +12 → 现在 +4
+
+
+        // shimmer
+        const shimmer = 0.65 + 0.35 * Math.sin(t * 2.0 + ht * 6.0);
+        const glowA = 0.16 + 0.12 * shimmer;
+        const coreA = 0.78 + 0.18 * shimmer;
+
+        segs.push({
+          z: zavg,
+          x1: Pa.x, y1: Pa.y,
+          x2: Pb.x, y2: Pb.y,
+          w, gw, coreA, glowA
+        });
+      }
+      segs.sort((a, b) => a.z - b.z);
+      for (const s of segs) {
+        drawGlowLine(ctx, s.x1, s.y1, s.x2, s.y2, s.w, s.gw, s.coreA, s.glowA);
+      }
+
+      // =========================
+      // Star
+      // =========================
+      const top = project3D(0, -treeHeight * 0.6 - 10, 0, fov, cx, cy);
+      drawGlowDot(ctx, top.x, top.y, 6, 24, STAR, 0.92, 0.22);
+      drawStar(ctx, top.x, top.y, 18 * top.s + 10, 8 * top.s + 5, t * 1.3, "rgba(255,220,70,1)");
+
+      // =========================
+      // Text (classic script style + glow)
+      // =========================
+      const text = "Merry Christmas 嘉欣";
+      // Use "classic script" candidates as fallback, then cursive:
+      ctx.save();
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+
+      const fontSize = Math.max(42, Math.min(72, Math.floor(W / 14)));
+      ctx.font = `${fontSize}px "Edwardian Script ITC","Snell Roundhand","Zapf Chancery","Segoe Script","Brush Script MT","Great Vibes",cursive`;
+
+      const tx = cx;
+      const ty = Math.max(24, H * 0.08);
+
+      // glow passes
+      ctx.fillStyle = "rgba(255,125,125,0.95)";
+      for (const [dx, dy] of [[-2,0],[2,0],[0,-2],[0,2],[-2,-2],[2,2]]) {
+        ctx.fillText(text, tx + dx, ty + dy);
+      }
+      // shadow
+      ctx.fillStyle = "rgba(30,0,0,0.95)";
+      ctx.fillText(text, tx + 2, ty + 3);
+
+      // main
+      ctx.fillStyle = "rgba(190,20,20,1)";
+      ctx.fillText(text, tx, ty);
+      ctx.restore();
+
+      // Foreground snow (a few bigger flakes)
+      for (let i = 0; i < 10; i++) {
+        const x = rand() * W;
+        const y = rand() * H;
+        const r = 2.5 + rand() * 2.0;
+        ctx.fillStyle = "rgba(255,255,255,1)";
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, TAU);
+        ctx.fill();
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    // Optional: if you want auto-start without audio (no overlay), uncomment:
+    // start(false);
+  </script>
+</body>
+</html>
